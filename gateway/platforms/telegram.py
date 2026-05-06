@@ -14,7 +14,7 @@ import os
 import tempfile
 import html as _html
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +278,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        # Background tasks for health checks and reconnection
+        self._background_tasks: set = set()
+        # Track last successful health check for proactive reconnection
+        self._last_health_check_ok: bool = True
+        self._health_check_task: Optional[asyncio.Task] = None
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
@@ -353,7 +358,10 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @classmethod
     def _message_thread_id_for_typing(cls, thread_id: Optional[str]) -> Optional[int]:
-        if not thread_id:
+        # Mirrors _message_thread_id_for_send: the General forum topic (thread id
+        # "1") is represented as "no thread id" on the wire. User-created topics
+        # keep their real id so typing stays scoped to that topic.
+        if not thread_id or str(thread_id) == cls._GENERAL_TOPIC_THREAD_ID:
             return None
         return int(thread_id)
 
@@ -578,6 +586,63 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             await self._handle_polling_network_error(probe_err)
 
+    async def _run_periodic_health_check(self) -> None:
+        """Proactively detect stale polling connections that don't produce errors.
+
+        The existing error callbacks only trigger on actual network errors, but
+        stale connections (where the TCP connection looks alive but Telegram has
+        closed its end) don't produce errors — they just hang forever. This
+        periodic check pings the bot API to verify the connection is still
+        responsive, and triggers a reconnection if not.
+
+        This prevents the 15+ minute outages that occur when typing in the
+        terminal "wakes up" the connections.
+        """
+        HEALTH_CHECK_INTERVAL = int(os.getenv("HERMES_TELEGRAM_HEALTH_CHECK_INTERVAL", "300"))  # 5 min
+        PROBE_TIMEOUT = 10
+
+        while not self.has_fatal_error:
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+            # Skip check if we're in webhook mode (not applicable)
+            if self._webhook_mode:
+                continue
+
+            # Skip check if updater is not running
+            if not (self._app and self._app.updater and self._app.updater.running):
+                logger.debug("[%s] Skipping health check: updater not running", self.name)
+                continue
+
+            try:
+                await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
+                self._last_health_check_ok = True
+                logger.debug("[%s] Health check OK", self.name)
+            except Exception as health_err:
+                if not self._last_health_check_ok:
+                    # Already failing, don't spam — let the network error handler deal with it
+                    logger.debug("[%s] Health check still failing: %s", self.name, health_err)
+                    continue
+
+                self._last_health_check_ok = False
+                logger.warning(
+                    "[%s] Health check failed — polling connection may be stale: %s. "
+                    "Triggering proactive reconnection.",
+                    self.name, health_err,
+                )
+                # Trigger reconnection via the existing network error handler
+                await self._handle_polling_network_error(health_err)
+
+    def _start_periodic_health_check(self) -> None:
+        """Start the background health check task."""
+        if self._health_check_task is not None and not self._health_check_task.done():
+            return  # Already running
+
+        self._health_check_task = asyncio.ensure_future(self._run_periodic_health_check())
+        self._background_tasks.add(self._health_check_task)
+        self._health_check_task.add_done_callback(self._background_tasks.discard)
+        logger.info("[%s] Started periodic health check (interval=%ds)",
+                    self.name, int(os.getenv("HERMES_TELEGRAM_HEALTH_CHECK_INTERVAL", "300")))
+
     async def _handle_polling_conflict(self, error: Exception) -> None:
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
@@ -687,6 +752,29 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, name, chat_id, e,
                 )
             return None
+
+    async def rename_dm_topic(
+        self,
+        chat_id: int,
+        thread_id: int,
+        name: str,
+    ) -> None:
+        """Rename a forum topic in a private (DM) chat."""
+        if not self._bot:
+            return
+        try:
+            chat_id_arg = int(chat_id)
+        except (TypeError, ValueError):
+            chat_id_arg = chat_id
+        await self._bot.edit_forum_topic(
+            chat_id=chat_id_arg,
+            message_thread_id=int(thread_id),
+            name=name,
+        )
+        logger.info(
+            "[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'",
+            self.name, chat_id, thread_id, name,
+        )
 
     def _persist_dm_topic_thread_id(self, chat_id: int, topic_name: str, thread_id: int) -> None:
         """Save a newly created thread_id back into config.yaml so it persists across restarts."""
@@ -1055,6 +1143,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     drop_pending_updates=True,
                     error_callback=_polling_error_callback,
                 )
+
+                # Start periodic health check to proactively detect stale polling connections
+                # that don't trigger network errors but still hang indefinitely
+                self._start_periodic_health_check()
             
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new
@@ -1108,6 +1200,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        # Cancel health check task first to stop it from triggering during shutdown
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+            try:
+                await asyncio.wait_for(self._health_check_task, timeout=2.0)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -1164,11 +1266,50 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        priority: Literal["silent", "normal", "urgent"] = "normal"
     ) -> SendResult:
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        
+        # Support priority via parameter or metadata (metadata takes precedence for backward compat)
+        effective_priority = priority
+        if metadata and "priority" in metadata:
+            effective_priority = metadata["priority"]
+        
+        # Auto-classify priority if still default "normal" - check content for silent indicators
+        if effective_priority == "normal" and content:
+            content_lower = content.lower()
+            
+            # Check for system message indicators
+            
+            # 1. Check for leading emoji (system messages often start with emoji)
+            system_emoji_prefixes = ['⏳', '🔄', '📊', '⏲️', '🔁', '⏱️', '📡', '🧠', '🤔', '💭', '⚙️', '🔧', '📝', '🔎', '🌐', '💻', '📥', '📤']
+            for emoji in system_emoji_prefixes:
+                if content.startswith(emoji):
+                    effective_priority = "silent"
+                    break
+            if effective_priority != "normal":
+                pass  # Already classified as silent
+            # 2. Check for silent patterns in content
+            elif any(pattern in content_lower for pattern in [
+                "still working", "iterating", "iteration", "checking ",
+                "analyzing", "processing", "searching", "running ",
+                "waiting for", "provider:", "retrying", "elapsed",
+                "thinking...", "working on this", "in progress",
+            ]):
+                effective_priority = "silent"
+            # 3. Check for urgent patterns
+            elif any(pattern in content_lower for pattern in [
+                "error", "failed", "exception", "crashed", "blocked",
+                "abort", "critical", "urgent", "requires approval",
+                "api key", "authentication", "unauthorized", "forbidden",
+            ]):
+                effective_priority = "urgent"
+        
+        # Determine notification setting based on priority
+        disable_notification = effective_priority == "silent"
         
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
@@ -1223,6 +1364,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 message_thread_id=effective_thread_id,
+                                disable_notification=disable_notification,
                                 **self._link_preview_kwargs(),
                             )
                         except Exception as md_error:
@@ -1236,6 +1378,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     message_thread_id=effective_thread_id,
+                                    disable_notification=disable_notification,
                                     **self._link_preview_kwargs(),
                                 )
                             else:
@@ -1430,6 +1573,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, prompt: str, default: str = "",
         session_key: str = "",
         metadata: Optional[Dict[str, Any]] = None,
+        priority: Literal["silent", "normal", "urgent"] = "normal"
     ) -> SendResult:
         """Send an inline-keyboard update prompt (Yes / No buttons).
 
@@ -1438,6 +1582,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        
+        # Determine notification setting - these prompts always notify
+        effective_priority = metadata.get("priority", priority) if metadata else priority
+        disable_notification = effective_priority == "silent"
+        
         try:
             default_hint = f" (default: {default})" if default else ""
             text = f"⚕ *Update needs your input:*\n\n{prompt}{default_hint}"
@@ -1455,6 +1604,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=keyboard,
                 message_thread_id=message_thread_id,
+                disable_notification=disable_notification,
                 **self._link_preview_kwargs(),
             )
             return SendResult(success=True, message_id=str(msg.message_id))
@@ -1466,6 +1616,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
         metadata: Optional[Dict[str, Any]] = None,
+        priority: Literal["silent", "normal", "urgent"] = "normal"
     ) -> SendResult:
         """Send an inline-keyboard approval prompt with interactive buttons.
 
@@ -1474,6 +1625,10 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        
+        # Determine notification setting - approval prompts always notify
+        effective_priority = metadata.get("priority", priority) if metadata else priority
+        disable_notification = effective_priority == "silent"
 
         try:
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
@@ -1510,6 +1665,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "text": text,
                 "parse_mode": ParseMode.HTML,
                 "reply_markup": keyboard,
+                "disable_notification": disable_notification,
                 **self._link_preview_kwargs(),
             }
             message_thread_id = self._message_thread_id_for_send(thread_id)
@@ -1529,10 +1685,15 @@ class TelegramAdapter(BasePlatformAdapter):
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
+        priority: Literal["silent", "normal", "urgent"] = "normal"
     ) -> SendResult:
         """Render a three-button slash-command confirmation prompt."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
+        
+        # Determine notification setting - confirmation prompts always notify
+        effective_priority = metadata.get("priority", priority) if metadata else priority
+        disable_notification = effective_priority == "silent"
 
         try:
             # Message body: render as plain text (message already contains
@@ -1555,6 +1716,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "text": preview,
                 "parse_mode": ParseMode.MARKDOWN,
                 "reply_markup": keyboard,
+                "disable_notification": disable_notification,
                 **self._link_preview_kwargs(),
             }
             message_thread_id = self._message_thread_id_for_send(thread_id)
@@ -2485,21 +2647,16 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 _typing_thread = self._metadata_thread_id(metadata)
                 message_thread_id = self._message_thread_id_for_typing(_typing_thread)
-                try:
-                    await self._bot.send_chat_action(
-                        chat_id=int(chat_id),
-                        action="typing",
-                        message_thread_id=message_thread_id,
-                    )
-                except Exception as e:
-                    if message_thread_id is not None and self._is_thread_not_found_error(e):
-                        await self._bot.send_chat_action(
-                            chat_id=int(chat_id),
-                            action="typing",
-                            message_thread_id=None,
-                        )
-                    else:
-                        raise
+                # No retry-without-thread fallback here: _message_thread_id_for_typing
+                # already maps the forum General topic to None, so any non-None value
+                # reaching this call is a user-created topic. If Telegram rejects it
+                # (e.g. topic deleted mid-session), we swallow the failure rather than
+                # showing a typing indicator in the wrong chat/All Messages.
+                await self._bot.send_chat_action(
+                    chat_id=int(chat_id),
+                    action="typing",
+                    message_thread_id=message_thread_id,
+                )
             except Exception as e:
                 # Typing failures are non-fatal; log at debug level only.
                 logger.debug(
