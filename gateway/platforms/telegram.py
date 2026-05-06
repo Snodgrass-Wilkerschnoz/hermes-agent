@@ -278,6 +278,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        # Background tasks for health checks and reconnection
+        self._background_tasks: set = set()
+        # Track last successful health check for proactive reconnection
+        self._last_health_check_ok: bool = True
+        self._health_check_task: Optional[asyncio.Task] = None
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
@@ -580,6 +585,63 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, HEARTBEAT_PROBE_DELAY, probe_err,
             )
             await self._handle_polling_network_error(probe_err)
+
+    async def _run_periodic_health_check(self) -> None:
+        """Proactively detect stale polling connections that don't produce errors.
+
+        The existing error callbacks only trigger on actual network errors, but
+        stale connections (where the TCP connection looks alive but Telegram has
+        closed its end) don't produce errors — they just hang forever. This
+        periodic check pings the bot API to verify the connection is still
+        responsive, and triggers a reconnection if not.
+
+        This prevents the 15+ minute outages that occur when typing in the
+        terminal "wakes up" the connections.
+        """
+        HEALTH_CHECK_INTERVAL = int(os.getenv("HERMES_TELEGRAM_HEALTH_CHECK_INTERVAL", "300"))  # 5 min
+        PROBE_TIMEOUT = 10
+
+        while not self.has_fatal_error:
+            await asyncio.sleep(HEALTH_CHECK_INTERVAL)
+
+            # Skip check if we're in webhook mode (not applicable)
+            if self._webhook_mode:
+                continue
+
+            # Skip check if updater is not running
+            if not (self._app and self._app.updater and self._app.updater.running):
+                logger.debug("[%s] Skipping health check: updater not running", self.name)
+                continue
+
+            try:
+                await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
+                self._last_health_check_ok = True
+                logger.debug("[%s] Health check OK", self.name)
+            except Exception as health_err:
+                if not self._last_health_check_ok:
+                    # Already failing, don't spam — let the network error handler deal with it
+                    logger.debug("[%s] Health check still failing: %s", self.name, health_err)
+                    continue
+
+                self._last_health_check_ok = False
+                logger.warning(
+                    "[%s] Health check failed — polling connection may be stale: %s. "
+                    "Triggering proactive reconnection.",
+                    self.name, health_err,
+                )
+                # Trigger reconnection via the existing network error handler
+                await self._handle_polling_network_error(health_err)
+
+    def _start_periodic_health_check(self) -> None:
+        """Start the background health check task."""
+        if self._health_check_task is not None and not self._health_check_task.done():
+            return  # Already running
+
+        self._health_check_task = asyncio.ensure_future(self._run_periodic_health_check())
+        self._background_tasks.add(self._health_check_task)
+        self._health_check_task.add_done_callback(self._background_tasks.discard)
+        logger.info("[%s] Started periodic health check (interval=%ds)",
+                    self.name, int(os.getenv("HERMES_TELEGRAM_HEALTH_CHECK_INTERVAL", "300")))
 
     async def _handle_polling_conflict(self, error: Exception) -> None:
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
@@ -1081,6 +1143,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     drop_pending_updates=True,
                     error_callback=_polling_error_callback,
                 )
+
+                # Start periodic health check to proactively detect stale polling connections
+                # that don't trigger network errors but still hang indefinitely
+                self._start_periodic_health_check()
             
             # Register bot commands so Telegram shows a hint menu when users type /
             # List is derived from the central COMMAND_REGISTRY — adding a new
@@ -1134,6 +1200,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        # Cancel health check task first to stop it from triggering during shutdown
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+            try:
+                await asyncio.wait_for(self._health_check_task, timeout=2.0)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
