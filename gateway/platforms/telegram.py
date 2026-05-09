@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import html as _html
 import re
 from typing import Dict, List, Optional, Any
@@ -268,6 +269,9 @@ class TelegramAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 4000
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
+    # Polling watchdog configuration
+    WATCHDOG_INTERVAL_SEC: float = 120.0   # how often to check
+    WATCHDOG_TIMEOUT_SEC: float = 300.0    # max silence before restart
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
@@ -294,6 +298,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        # Polling watchdog: track last update received time for stuck detection
+        self._last_update_received_at: float = time.time()
+        self._watchdog_task: Optional[asyncio.Task] = None
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # DM Topics config from extra.dm_topics
@@ -699,7 +706,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if self.has_fatal_error:
             return
         if not (self._app and self._app.updater and self._app.updater.running):
-            logger.warning(
+            self._logger.warning(
                 "[%s] Updater not running %ds after reconnect — treating as wedged",
                 self.name, HEARTBEAT_PROBE_DELAY,
             )
@@ -709,13 +716,55 @@ class TelegramAdapter(BasePlatformAdapter):
             return
 
         try:
-            await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
+            # Probe the actual polling path, not the general request pool
+            updates = await asyncio.wait_for(
+                self._app.bot.get_updates(limit=1, timeout=PROBE_TIMEOUT),
+                PROBE_TIMEOUT + 5  # extra buffer for the get_updates call itself
+            )
+            self._logger.info(
+                "Polling reconnect verified: received %d update(s).", len(updates)
+            )
         except Exception as probe_err:
-            logger.warning(
+            self._logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
                 self.name, HEARTBEAT_PROBE_DELAY, probe_err,
             )
             await self._handle_polling_network_error(probe_err)
+
+    async def _polling_watchdog_loop(self) -> None:
+        """Periodically verify polling is still receiving updates."""
+        while True:
+            await asyncio.sleep(self.WATCHDOG_INTERVAL_SEC)
+
+            if not self._app or not self._app.updater:
+                continue
+
+            if not self._app.updater.running:
+                # Updater is not running; reconnect logic should handle this.
+                continue
+
+            elapsed = time.time() - self._last_update_received_at
+            if elapsed > self.WATCHDOG_TIMEOUT_SEC:
+                self._logger.warning(
+                    "Polling watchdog triggered: no updates for %.0f seconds. "
+                    "Forcing reconnect.",
+                    elapsed,
+                )
+                await self._force_polling_restart()
+
+    async def _force_polling_restart(self) -> None:
+        """Stop and restart the PTB updater to recover from a silent hang."""
+        try:
+            if self._app.updater:
+                self._logger.info("Stopping updater for forced restart...")
+                await self._app.updater.stop()
+                await asyncio.sleep(2)  # brief cooldown for TCP cleanup
+                self._logger.info("Restarting updater...")
+                await self._app.updater.start_polling()
+                self._last_update_received_at = time.time()
+                self._logger.info("Updater restarted successfully.")
+        except Exception as e:
+            self._logger.exception("Failed to force restart updater: %s", e)
 
     async def _handle_polling_conflict(self, error: Exception) -> None:
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
@@ -1259,6 +1308,9 @@ class TelegramAdapter(BasePlatformAdapter):
                     self.name, topics_err, exc_info=True,
                 )
 
+            # Start polling watchdog
+            self._watchdog_task = asyncio.create_task(self._polling_watchdog_loop())
+
             return True
             
         except Exception as e:
@@ -1270,6 +1322,14 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop polling/webhook, cancel pending album flushes, and disconnect."""
+        # Cancel polling watchdog
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+
         pending_media_group_tasks = list(self._media_group_tasks.values())
         for task in pending_media_group_tasks:
             task.cancel()
@@ -2092,6 +2152,8 @@ class TelegramAdapter(BasePlatformAdapter):
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
         """Handle inline keyboard button clicks."""
+        # Update timestamp for polling watchdog
+        self._last_update_received_at = time.time()
         query = update.callback_query
         if not query or not query.data:
             return
@@ -3333,6 +3395,8 @@ class TelegramAdapter(BasePlatformAdapter):
         rapid successive text messages from the same user/chat and aggregate
         them into a single MessageEvent before dispatching.
         """
+        # Update timestamp for polling watchdog
+        self._last_update_received_at = time.time()
         if not update.message or not update.message.text:
             return
         if not self._should_process_message(update.message):
@@ -3344,6 +3408,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
+        # Update timestamp for polling watchdog
+        self._last_update_received_at = time.time()
         if not update.message or not update.message.text:
             return
         if not self._should_process_message(update.message, is_command=True):
@@ -3354,6 +3420,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
+        # Update timestamp for polling watchdog
+        self._last_update_received_at = time.time()
         if not update.message:
             return
         if not self._should_process_message(update.message):
@@ -3513,6 +3581,8 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
+        # Update timestamp for polling watchdog
+        self._last_update_received_at = time.time()
         if not update.message:
             return
         if not self._should_process_message(update.message):
