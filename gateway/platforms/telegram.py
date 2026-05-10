@@ -746,23 +746,25 @@ class TelegramAdapter(BasePlatformAdapter):
             elapsed = time.time() - self._last_update_received_at
             if elapsed > self.WATCHDOG_TIMEOUT_SEC:
                 self._logger.warning(
-                    "Polling watchdog triggered: no updates for %.0f seconds. "
-                    "Forcing reconnect.",
+                    "watchdog_check elapsed=%.1f status=triggered action=force_restart",
                     elapsed,
                 )
                 await self._force_polling_restart()
+            else:
+                # Healthy check - log at DEBUG for monitoring
+                self._logger.debug("watchdog_check elapsed=%.1f status=ok", elapsed)
 
     async def _force_polling_restart(self) -> None:
         """Stop and restart the PTB updater to recover from a silent hang."""
         try:
             if self._app.updater:
-                self._logger.info("Stopping updater for forced restart...")
+                self._logger.info("watchdog_action=restart_updater status=starting")
                 await self._app.updater.stop()
                 await asyncio.sleep(2)  # brief cooldown for TCP cleanup
                 self._logger.info("Restarting updater...")
                 await self._app.updater.start_polling()
                 self._last_update_received_at = time.time()
-                self._logger.info("Updater restarted successfully.")
+                self._logger.info("watchdog_action=restart_updater status=success")
         except Exception as e:
             self._logger.exception("Failed to force restart updater: %s", e)
 
