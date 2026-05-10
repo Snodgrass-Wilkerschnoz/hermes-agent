@@ -269,9 +269,9 @@ class TelegramAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 4000
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
-    # Polling watchdog configuration
-    WATCHDOG_INTERVAL_SEC: float = 120.0   # how often to check
-    WATCHDOG_TIMEOUT_SEC: float = 300.0    # max silence before restart
+    # Polling watchdog configuration (can be overridden via environment variables for testing)
+    WATCHDOG_INTERVAL_SEC: float = float(os.getenv("HERMES_TELEGRAM_WATCHDOG_INTERVAL_SEC", "120.0"))
+    WATCHDOG_TIMEOUT_SEC: float = float(os.getenv("HERMES_TELEGRAM_WATCHDOG_TIMEOUT_SEC", "300.0"))
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
